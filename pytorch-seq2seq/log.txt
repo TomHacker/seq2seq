@@ -1,0 +1,2 @@
+Steps per epoch:  537
+Epoch: 1, Step: 0

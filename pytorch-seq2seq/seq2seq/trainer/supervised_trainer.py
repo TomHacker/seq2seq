@@ -59,25 +59,35 @@ class SupervisedTrainer(object):
             state_loss = self.state_loss
             state_loss.reset()
         # Forward propagation
-        (decoder_outputs, decoder_hidden, other), (state, response_concept) = model(input_variable, input_lengths,
-                                                                                    target_variable,
-                                                                                    teacher_forcing_ratio=teacher_forcing_ratio,
-                                                                                    concept=concept, vocabs=vocabs,
-                                                                                    use_concept=use_concept)
+        if use_concept:
+            (decoder_outputs, decoder_hidden, other), (state, response_concept) = model(input_variable, input_lengths,
+                                                                                        target_variable,
+                                                                                        teacher_forcing_ratio=teacher_forcing_ratio,
+                                                                                        concept=concept, vocabs=vocabs,
+                                                                                        use_concept=use_concept)
+        else:
+            decoder_outputs, decoder_hidden, other = model(input_variable, input_lengths,
+                                                           target_variable,
+                                                           teacher_forcing_ratio=teacher_forcing_ratio,
+                                                           concept=concept, vocabs=vocabs,
+                                                           use_concept=use_concept)
         # Get loss
         loss.reset()
         for step, step_output in enumerate(decoder_outputs):
             batch_size = target_variable.size(0)
             loss.eval_batch(step_output.contiguous().view(batch_size, -1), target_variable[:, step + 1])
 
-        for i in range(len(response_concept)):
-            for j in range(len(response_concept[i])):
-                arg1 = state[i].unsqueeze(0)
-                arg2 = torch.tensor([response_concept[i][j]])
-                if torch.cuda.is_available():
-                    arg2 = arg2.cuda()
-                state_loss.acc_loss += state_loss.criterion(arg1, arg2)
-                state_loss.norm_term += 1
+        """ 
+        if use_concept:
+            for i in range(len(response_concept)):
+                for j in range(len(response_concept[i])):
+                    arg1 = state[i].unsqueeze(0)
+                    arg2 = torch.tensor([response_concept[i][j]])
+                    if torch.cuda.is_available():
+                        arg2 = arg2.cuda()
+                    state_loss.acc_loss += state_loss.criterion(arg1, arg2)
+                    state_loss.norm_term += 1
+        """
         """
         for i in range(response_concept.shape[1]):
             state_loss.eval_batch(state.contiguous().view(batch_size, -1), response_concept[:, i])
@@ -86,19 +96,23 @@ class SupervisedTrainer(object):
         model.zero_grad()
 
         lvalue = loss.get_loss()
-        state_value = state_loss.get_loss()
+        if use_concept:
+            #state_value = state_loss.get_loss()
+            state_value = 0
         if lvalue >= 0:
             if use_concept:
-                #loss.backward(retain_graph=True)
+                # loss.backward(retain_graph=True)
                 loss.backward()
-                #state_loss.backward()
+                # state_loss.backward()
             else:
                 loss.backward()
             self.optimizer.step()
         else:
             raise AssertionError("NAN Triggered!")
-
-        return lvalue, state_value
+        if use_concept:
+            return lvalue, state_value
+        else:
+            return lvalue
 
     def _train_epoches(self, data, model, n_epochs, start_epoch, start_step, save_file=False, dev_data=None,
                        teacher_forcing_ratio=0, vocabs=None, use_concept=False, log_dir=None, embed_file=None):
@@ -130,8 +144,8 @@ class SupervisedTrainer(object):
         step_elapsed = 0
         for epoch in range(start_epoch, n_epochs + 1):
             print("Epoch: %d, Step: %d" % (epoch, step))
-            if epoch > 20:
-                teacher_forcing_ratio = 0
+            #if epoch > 20:
+            #    teacher_forcing_ratio = 0
 
             batch_generator = batch_iterator.__iter__()
             # consuming seen batches from previous training
@@ -157,9 +171,15 @@ class SupervisedTrainer(object):
                     concepts = []
                 target_variables = getattr(batch, seq2seq.tgt_field_name)
 
-                loss, state_loss = self._train_batch(input_variables, input_lengths.tolist(), target_variables, model,
-                                         teacher_forcing_ratio, concept=concepts, vocabs=vocabs,
-                                         use_concept=use_concept)
+                if use_concept:
+                    loss, state_loss = self._train_batch(input_variables, input_lengths.tolist(), target_variables, model,
+                                                         teacher_forcing_ratio, concept=concepts, vocabs=vocabs,
+                                                         use_concept=use_concept)
+                else:
+                    loss = self._train_batch(input_variables, input_lengths.tolist(), target_variables, model,
+                                                         teacher_forcing_ratio, concept=concepts, vocabs=vocabs,
+                                                         use_concept=use_concept)
+                    state_loss = 0
 
                 # FOR NAN DEBUG
                 if not loss >= 0:
@@ -175,6 +195,7 @@ class SupervisedTrainer(object):
                 print_loss_total += loss
                 epoch_loss_total += loss
 
+
                 if step % self.print_every == 0 and step_elapsed > self.print_every:
                     print_loss_avg = print_loss_total / self.print_every
                     print_loss_total = 0
@@ -186,7 +207,7 @@ class SupervisedTrainer(object):
                         state_loss)
                     log.info(log_msg)
 
-                if step % 100 == 0:
+                if step % 200 == 0:
                     dev_loss, accuracy = self.evaluator.evaluate(model, dev_data, vocabs=vocabs,
                                                                  use_concept=use_concept, cur_step=step,
                                                                  log_dir=log_dir)
@@ -216,6 +237,8 @@ class SupervisedTrainer(object):
             epoch_loss_avg = epoch_loss_total / min(steps_per_epoch, step - start_step)
             epoch_loss_total = 0
             log_msg = "Finished epoch %d: Train %s: %.4f" % (epoch, self.loss.name, epoch_loss_avg)
+            with open(log_dir + '/log.txt', 'a+', encoding='utf-8') as file:
+                file.write("Step {}, avg loss: {}\n".format(step, epoch_loss_avg))
             if dev_data is not None:
                 dev_loss, accuracy = self.evaluator.evaluate(model, dev_data, vocabs=vocabs,
                                                              use_concept=use_concept,
@@ -237,7 +260,7 @@ class SupervisedTrainer(object):
 
     def train(self, model, data, num_epochs=5, resume=False, dev_data=None,
               optimizer=None, teacher_forcing_ratio=0, src_vocab=None, cpt_vocab=None, tgt_vocab=None,
-              use_concept=False, vocabs=None, save_file=False, log_dir=None, embed_file=None):
+              use_concept=False, vocabs=None, save_file=False, log_dir=None, embed_file=None, full_matrix=None):
         """ Run training for a given model.
 
         Args:
@@ -259,6 +282,7 @@ class SupervisedTrainer(object):
             latest_checkpoint_path = Checkpoint.get_latest_checkpoint(self.expt_dir)
             resume_checkpoint = Checkpoint.load(latest_checkpoint_path)
             model = resume_checkpoint.model
+            model.full_matrix=full_matrix
             self.optimizer = resume_checkpoint.optimizer
 
             # A walk around to set optimizing parameters properly

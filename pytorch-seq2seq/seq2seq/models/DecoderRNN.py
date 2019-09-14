@@ -114,8 +114,8 @@ class DecoderRNN(BaseRNN):
         """
         embedded = self.embedding(input_var)
         embedded = self.input_dropout(embedded)
-        tmp = torch.zeros_like(concept_rep)
         if use_copy:
+            tmp = torch.zeros_like(concept_rep)
             decoder_input = torch.cat([mix, embedded, tmp], dim=-1)
         else:
             decoder_input = torch.cat([mix, embedded], dim=-1)
@@ -169,6 +169,7 @@ class DecoderRNN(BaseRNN):
 
         # 下面所做的事是把concept_distribution从状态集映射成vocabulary上的概率分布，最终得到
         # score_copy就是 batch * vocab 长度的向量
+        """
         mapped_concepts = []
         max_len = max([len(line) for line in concepts])
         for i in range(len(concepts)):
@@ -183,11 +184,13 @@ class DecoderRNN(BaseRNN):
             mapped_concepts.append(mapped_sent)
         mapped_concepts_tensor = torch.tensor(mapped_concepts)
         score_copy = torch.zeros((len(concepts), self.output_size + 1))
+        """
+        score_copy = torch.zeros((len(concepts), self.output_size))
         if torch.cuda.is_available():
-            mapped_concepts_tensor = mapped_concepts_tensor.cuda()
+            #mapped_concepts_tensor = mapped_concepts_tensor.cuda()
             score_copy = score_copy.cuda()
-        score_copy = score_copy.scatter(1, mapped_concepts_tensor, copy_distribution)
-        score_copy = score_copy[:, :-1]
+        score_copy = score_copy.scatter(1, concepts, copy_distribution)
+        #score_copy = score_copy[:, :-1]
         if torch.cuda.is_available():
             score_copy = score_copy.cuda()
         """

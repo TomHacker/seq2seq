@@ -5,6 +5,8 @@ from sklearn.feature_extraction.text import TfidfTransformer, CountVectorizer
 import pandas as pd
 import copy
 import pickle
+import numpy as np
+import time
 
 
 def load_data(path):
@@ -35,8 +37,8 @@ def get_tfidf_list(docs_for_tfidf):
     return ascend_result
 
 
-def get_concepts(data, cn, stopwords):
-    cpt_per_utt = [[list(set([word for word in sentence if word in cn.cpt_dict and word not in stopwords])) for sentence in dialog] for dialog in data]
+def get_concepts(data, cn, stopwords, vocab):
+    cpt_per_utt = [[list(set([word for word in sentence if word in cn.cpt_dict and word not in stopwords and word in vocab])) for sentence in dialog] for dialog in data]
     cpt_linear = []
     for dialog in cpt_per_utt:
         cpt = []
@@ -79,10 +81,13 @@ def expand_by_path(concepts, k, cn, vocab=None, stopword=None):
     expanded = []
     total = len(concepts)
     per_step = int(total / 20)
+    time_start = time.time()
     for i in range(len(concepts)):
         expanded.append(cn.expand_list_by_path(concepts[i], k, vocab, stopword))
-        if i % per_step == 0:
+        if per_step > 0 and i % per_step == 0:
             print("{}% completed.".format(i * 100 / total))
+    end_time = time.time()
+    print((end_time - time_start) / len(concepts))
     return expanded
 
 
@@ -223,17 +228,74 @@ def decay_detection(cpt_res, cpt_per_utt, cn):
     return distance_dict
 
 
+def adjacent_num(cpt, cpt_list, cn):
+    return len([word for word in cpt_list if cpt in cn.cpt_dict[word]])
+
+
+def adjacent_avg(cpt_ctx, cpt_res, cn):
+    ls = [adjacent_num(word, cpt_ctx, cn) for word in cpt_res]
+    ls = [num for num in ls if num != 0]
+    return sum(ls) / len(ls)
+
+
+def adjacent_corpus(cpt_ctx, cpt_res, cn):
+    time_dict = {}
+    for i in range(len(cpt_ctx)):
+        res = [adjacent_num(word, cpt_ctx[i], cn) for word in cpt_res[i]]
+        res = [num for num in res if num != 0]
+        for num in res:
+            if num in time_dict:
+                time_dict[num] += 1
+            else:
+                time_dict[num] = 1
+    return time_dict
+
+
+def adjacent_time(cpt_ctx, cpt_res, cn, vocab, stopword):
+    time_dict = {}
+    for i in range(len(cpt_ctx)):
+        tmp_dict = cn.expand_list_by_path(cpt_ctx[i], 0, vocab, stopword, return_dict=True)
+        for item in tmp_dict.items():
+            if item[0] not in time_dict:
+                time_dict[item[0]] = item[1]
+            else:
+                time_dict[item[0]] += item[1]
+    return time_dict
+
+
+def get_comparison(cpt_ctx, cpt_res, cn, vocab, stopwords):
+    time_dict = adjacent_time(cpt_ctx, cpt_res, cn, vocab, stopwords)
+    res_dict = adjacent_corpus(cpt_ctx, cpt_res, cn)
+    total_time = sum(time_dict.values())
+    total_res = sum(res_dict.values())
+    for item in time_dict.items():
+        time_dict[item[0]] /= total_time
+    for item in res_dict.items():
+        res_dict[item[0]] /= total_res
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots()
+    x = np.arange(1, 32, 1)
+    v1 = [item[1] for item in sorted(time_dict.items(), key=lambda x: x[0])]
+    v2 = [item[1] for item in sorted(res_dict.items(), key=lambda x: x[0])]
+    ax.plot(x[:20], v1[:20])
+    ax.plot(x[:20], v2[:20])
+    fig.show()
+
+
 def main():
     vocab = pickle.load(open("vocab", "rb"))
-    path = '../../../ConceptNet/train'
+    vocab_full = pickle.load(open("vocab_full", "rb"))
+    path = '../../../ConceptNet/valid'
     cn = ConceptNet("../../../ConceptNet/concept_dict.json")
     stopwords = [word.strip() for word in open('../../../ConceptNet/stopword.txt').readlines()]
+    stopwords = {word: 1 for word in stopwords}
     data = pickle.load(open(path, "rb"))
     #tf_idf = get_tfidf_list(docs_for_tfidf)
     #tfidf_dict = dict(zip(tf_idf.index, tf_idf.values))
-    cpt_per_utt, cpt_linear = get_concepts(data, cn, stopwords)
+    cpt_per_utt, cpt_linear = get_concepts(data, cn, stopwords, vocab)
     cpt_ctx, cpt_res = split_cpt(cpt_per_utt, 1)
     print("Processing completed.")
+    full_matrix = cn.get_all(vocab, vocab_full, stopwords)
     """
     filtered_cpt_linear = get_topK_by_tfidf(cpt_per_utt, cpt_linear, tfidf_dict, 20)
     expanded_cpt_linear = []
@@ -244,7 +306,6 @@ def main():
         indexes.append(index)
     #result = [[cn.expand_form_of(utt) for utt in line] for line in cpt_per_utt]
     #print(sum([len(line) for line in result]) / len(result))
-    """
     expanded = expand_by_path(cpt_ctx, 1000, cn, vocab, stopwords)
     f_1 = [expanded[i] + cpt_ctx[i] for i in range(len(expanded))]
     print("Expand path-1 completed.")
@@ -253,6 +314,7 @@ def main():
     print("Expand path-2 completed.")
     print(guide_rate_concept(cpt_res, f_2))
     f_2 = [[word for word in f_2[i] if word not in cpt_ctx[i]] for i in range(len(f_2))]
-    write_file('train_4.tsv', data, cpt_per_utt, f_2, cpt_res=cpt_res)
+    write_file('valid_3.tsv', data, cpt_per_utt, f_2, cpt_res=cpt_res)
+    """
 
-main()
+#main()

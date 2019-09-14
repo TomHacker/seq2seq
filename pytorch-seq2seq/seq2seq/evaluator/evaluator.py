@@ -65,6 +65,7 @@ class Evaluator(object):
         state_corpus = []
         with torch.no_grad():
             for batch in batch_iterator:
+                print(cnt)
                 cnt += 1
                 input_variables, input_lengths = getattr(batch, seq2seq.src_field_name)
 

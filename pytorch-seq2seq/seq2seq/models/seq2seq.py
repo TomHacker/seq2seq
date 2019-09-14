@@ -41,11 +41,9 @@ class Seq2seq(nn.Module):
     """
 
     def __init__(self, encoder, decoder, dialog_encoder=None, decode_function=F.log_softmax, cpt_vocab=None,
-                 hidden_size=128, concept_level='simple', mid_size=64, dialog_hidden=128, conceptnet_file=None):
+                 hidden_size=128, concept_level='simple', mid_size=64, dialog_hidden=128, full_matrix=None):
         super(Seq2seq, self).__init__()
         self.concept_level = concept_level
-        #if conceptnet_file:
-        #    self.concept_net = ConceptNet(conceptnet_file)
         self.encoder = encoder
         self.decoder = decoder
         self.dialog_encoder = dialog_encoder
@@ -65,6 +63,8 @@ class Seq2seq(nn.Module):
         self.decoder_input_MLP = torch.nn.Linear(2 * hidden_size, 2 * hidden_size)
         self.sigmoid = torch.nn.Sigmoid()
         self.hidden = hidden_size
+        self.full_matrix = full_matrix
+        self.walk = torch.nn.Linear(hidden_size, hidden_size, bias=False)
 
     def flatten_parameters(self):
         self.encoder.rnn.flatten_parameters()
@@ -356,8 +356,8 @@ class Seq2seq(nn.Module):
         for i in range(batch_size):
             concept_rep.append(torch.mm(states[i].unsqueeze(0), embedding_linear[i]))
         """
-        concept_rep = torch.bmm(state.unsqueeze(1), embedding_linear).squeeze()
-        #concept_rep = torch.zeros((len(embedding), self.hidden))
+        #concept_rep = torch.bmm(state.unsqueeze(1), embedding_linear).squeeze()
+        concept_rep = torch.zeros((len(embedding), self.hidden))
         if torch.cuda.is_available():
             concept_rep = concept_rep.cuda()
         return state, concept_linear, embedding_linear, concept_rep
@@ -381,9 +381,11 @@ class Seq2seq(nn.Module):
             concept_linear.append(res)
             emb_linear.append(emb)
 
+        """
         for i in range(len(concept_batch)):
             emb_linear[i] = torch.cat([emb_linear[i], expand_embedding[i]], dim=0)
             concept_linear[i].extend(expand_batch[i])
+        """
 
         emb_linear = self.embedding_padding(emb_linear)
 
@@ -393,10 +395,9 @@ class Seq2seq(nn.Module):
         res_e = self.layer_e(emb_linear)
         res = self.layer_att(res_e + res_c).squeeze()
         res = self.softmax(res)
-
-        # o是所有concept的embedding加权和，相当于concept的总结向量
-        #o = torch.bmm(res.unsqueeze(1), emb_linear).squeeze()
-        o = torch.zeros((len(emb_linear), self.hidden)).cuda()
+        #s = torch.sum(res, dim=-1).reshape((-1, 1))
+        #res /= s
+        o = torch.bmm(res.unsqueeze(1), emb_linear).squeeze()
         return res, concept_linear, emb_linear, o
 
     def extend_batch(self, batch_concepts, cpt_vocab, batch_states):
@@ -412,17 +413,40 @@ class Seq2seq(nn.Module):
         embeddings = self.cpt_embedding(torch.tensor(new_concepts))
         print(sum([len(line) for line in new_concepts]) / len(new_concepts))
 
-    def language_planning(self, batch_states, origin_concepts, expand_batch, index_batch, vocab, context, last_utt):
-        max_concepts = max([len(line) for line in expand_batch])
-        expand_batch = [list(line) for line in expand_batch]
-        for i in range(len(expand_batch)):
-            if len(expand_batch[i]) < max_concepts:
-                expand_batch[i].extend((max_concepts - len(expand_batch[i])) * [vocab.stoi['<pad>']])
-        embedding = self.cpt_embedding(torch.tensor(expand_batch))
-        res_e = self.layer_e(embedding)
-        res_u = self.layer_u(last_utt).unsqueeze(1)
-        res_c = self.layer_c(context)
-        res = self.softmax(torch.nn.functional.tanh(self.layer_att(res_e + res_u + res_c)).reshape(len(batch_states), -1))
+    # 此处是language planning代码，做的操作是：基于初始算好的上文concept分布 batch_states,根据conceptnet相连情况进行
+    # 图传播，使用的估算方式为 P'·(A+A^2),其中·操作是元素点乘，P'是由[pi·pj]构成的|vocab * vocab|矩阵，pi是常量，后续也可以
+    # 做成向量
+    def language_planning(self, batch_states, batch_concepts, src_vocab, cpt_vocab, context):
+        # 把上文concept转化为source vocabulary上的index，因为concept被限制在了这个vocab内
+        concepts_src_index = [[src_vocab.stoi[cpt_vocab.itos[word]] for word in line] for line in batch_concepts]
+        # padding
+        max_concepts = max([len(line) for line in batch_concepts])
+        for line in concepts_src_index:
+            if len(line) < max_concepts:
+                line.extend((max_concepts - len(line)) * [src_vocab.stoi['<pad>']])
+        concepts_src_index = np.array(concepts_src_index)
+        # full_matrix是A+A^2矩阵，已经预算好存在内存中
+        initial_two_walk = torch.tensor([self.full_matrix[concepts_src_index[i]] for i in range(len(concepts_src_index))], dtype=torch.float32)
+        if torch.cuda.is_available():
+            initial_two_walk = initial_two_walk.cuda()
+        # 用来估算图传播的P向量
+        embedding_all = torch.cat([self.encoder.embedding(torch.tensor(np.arange(0, len(src_vocab.itos), 1))).unsqueeze(0)] * len(batch_concepts))
+        p = torch.bmm(self.walk(embedding_all), context.squeeze().unsqueeze(-1)).squeeze()
+
+        # TODO: 把p向量使用外积方式得到P'并与initial_two_walk进行元素点乘
+        # 注意：不能直接硬搞得到batch * |vocab| * |vocab|的矩阵，这个存都存不下。必须限制在batch * |context| * |vocab|之内
+
+        # 将图传播算好的转移矩阵与初始概率分布相乘，得到最终concept distribution
+        dynamic_two_walk = torch.bmm(batch_states.unsqueeze(1), initial_two_walk).squeeze()
+        # 限制计算量，只选最高概率的K个用于后续计算
+        extend_state, extend_index = torch.topk(dynamic_two_walk, 300, 1)
+        # normalize
+        isum = torch.sum(extend_state, dim=1).unsqueeze(1)
+        extend_state = extend_state / isum
+        extend_embedding = self.encoder.embedding(extend_index)
+        # 计算concept的summary vector
+        o = torch.bmm(extend_state.unsqueeze(1), extend_embedding).squeeze()
+        return extend_state, extend_index, extend_embedding, o
 
     def forward(self, input_variable, input_lengths=None, target_variable=None,
                 teacher_forcing_ratio=0, concept=None, vocabs=None, use_concept=False, track_state=False):
@@ -463,11 +487,15 @@ class Seq2seq(nn.Module):
             all_encoder_hiddens = [line.unsqueeze(0) for line in all_encoder_hiddens]
             all_encoder_hiddens = torch.cat(all_encoder_hiddens, 0)
 
+            # 使用上文的utterance representation来计算context vector
             dialog_output, (context, _) = self.dialog_encoder(encoder_hidden_dialog)
+
+            # 开始对concept进行处理，先抽上文、language planning拓展和response里的concept
             concept_batch, embedding_batch, expanded_batch, embedding_expand, response_concept, embedding_response = self.concept_mapping(concept, cpt_vocab, src_vocab)
             batch_state = []
             batch_concepts = []
             batch_embeddings = []
+            # 进行dialog state control，如果单独做language planning的话，此处产生的concept就只来源于上文
             if self.concept_level == 'simple':
                 batch_state, batch_concepts, batch_embeddings, o = self.single_turn_state_track(concept_batch,
                                                                                                 embedding_batch,
@@ -478,27 +506,24 @@ class Seq2seq(nn.Module):
                 batch_state, batch_concepts, batch_embeddings, o = self.state_track(concept_batch, embedding_batch,
                                                                                     dialog_output, encoder_hidden_dialog,
                                                                                     pad_index, expanded_batch, embedding_expand, cpt_vocab)
+
+            # language planning
+            batch_state, batch_concepts, batch_embeddings, o = self.language_planning(batch_state, batch_concepts, src_vocab, cpt_vocab, context)
+
             if track_state:
                 res_all = []
                 for i in range(len(batch_concepts)):
-                    res = print_state(batch_concepts[i], batch_state[i], cpt_vocab)
+                    res = print_state(batch_concepts[i], batch_state[i], src_vocab)
                     res_all.append(res)
 
-            # handling response concepts
-            mapped_concepts = []
-            max_cpt_len = max([len(line) for line in batch_concepts])
-            for i in range(len(batch_concepts)):
-                if len(batch_concepts[i]) < max_cpt_len:
-                    mapped_concepts.append(batch_concepts[i] + (max_cpt_len - len(batch_concepts[i])) * [cpt_vocab.stoi['<pad>']])
-                else:
-                    mapped_concepts.append(batch_concepts[i])
-            mapped_concepts = torch.tensor(mapped_concepts)
-            state_score = torch.zeros((len(batch_state), len(cpt_vocab.itos)))
+            # 处理response concept，这个步骤仅在算state loss有用，如果不用这个，可以直接注释掉
+            state_score = torch.zeros((len(batch_state), len(src_vocab.itos)))
             if torch.cuda.is_available():
-                mapped_concepts = mapped_concepts.cuda()
                 state_score = state_score.cuda()
-            state_score = state_score.scatter(1, mapped_concepts, batch_state)
+            state_score = state_score.scatter(1, batch_concepts, batch_state)
             response_concept = [[word for word in line if word in batch_concepts[k] and word != cpt_vocab.stoi['<unk>']] for k, line in enumerate(response_concept)]
+
+            # response processing
             """
             max_len = max([len(line) for line in response_concept])
             for i in range(len(response_concept)):
@@ -508,8 +533,8 @@ class Seq2seq(nn.Module):
             """
 
             last_state = dialog_output[:, -1, :].unsqueeze(0)
-            #last_state = torch.cat((last_state, o.unsqueeze(0)))
-            last_state = torch.cat((last_state, torch.zeros_like(last_state)))
+            last_state = torch.cat((last_state, o.unsqueeze(0)))
+            #last_state = torch.cat((last_state, torch.zeros_like(last_state)))
             o = o.unsqueeze(1)
             #last_state = torch.cat((last_state, o), dim=-1)
             #decoder_input = self.decoder_input_MLP(last_state)
